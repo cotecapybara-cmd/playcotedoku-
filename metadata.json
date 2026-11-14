@@ -1,0 +1,8 @@
+{
+  "name": "PLAYCOTEDOKU",
+  "description": "A cozy, coffee-inspired online Sudoku community with capybara avatars, solo puzzles, daily challenges, and real-time cooperative & 1v1 multiplayer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
