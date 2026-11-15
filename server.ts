@@ -32,7 +32,9 @@ import { ACHIEVEMENTS, getLevelFromXp } from './src/shared/achievements.ts';
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = path.resolve(
+  process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(process.cwd(), 'data')
+);
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -514,7 +516,12 @@ function awardStatsAndAchievements(params: {
 
 // Express App Setup
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
+
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({ ok: true });
+});
 
 interface AuthedRequest extends Request {
   user?: DbUserRow;
