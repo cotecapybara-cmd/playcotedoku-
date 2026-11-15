@@ -54,6 +54,13 @@ export interface SudokuBoardProps {
   isPaused?: boolean;
   readOnly?: boolean;
   coopActors?: Record<string, CoopCellActor>;
+  puzzleKey?: string;
+  multiplayerMatchHintsLeft?: number;
+  accountHintCredits?: number;
+  accountPencilCredits?: number;
+  fastPencilUnlocked?: boolean;
+  onMultiplayerHint?: (row?: number, col?: number) => void;
+  onMultiplayerUnlockFastPencil?: () => void;
   onTogglePause?: () => void;
   onNewGame?: (difficulty: Difficulty) => void;
   onLocalStateChange?: (next: {
@@ -89,33 +96,48 @@ export function SudokuBoard({
   isPaused = false,
   readOnly = false,
   coopActors,
+  puzzleKey: puzzleKeyProp,
+  multiplayerMatchHintsLeft = 3,
+  accountHintCredits = 0,
+  accountPencilCredits = 0,
+  fastPencilUnlocked = false,
+  onMultiplayerHint,
+  onMultiplayerUnlockFastPencil,
   onTogglePause,
   onNewGame,
   onLocalStateChange,
   onMultiplayerMove,
   onSolved,
 }: SudokuBoardProps) {
+  const isMultiplayer = mode === 'coop' || mode === 'race';
   const [selectedCell, setSelectedCell] = useState<[number, number] | null>(null);
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
   const [boardCellHighlight, setBoardCellHighlight] = useState(false);
   const [pencilMode, setPencilMode] = useState(false);
-  const [fastPencil, setFastPencil] = useState(fastPencilDefault);
+  const [fastPencil, setFastPencil] = useState(isMultiplayer ? Boolean(fastPencilUnlocked) : fastPencilDefault);
   const [undoStack, setUndoStack] = useState<UndoSnapshot[]>([]);
   const [showNewGameMenu, setShowNewGameMenu] = useState(false);
   const [errorCellKey, setErrorCellKey] = useState<string | null>(null);
+  const [creditNotice, setCreditNotice] = useState<string | null>(null);
 
   // Track which cells have already awarded score so erasing & re-entering doesn't inflate score
   const scoredCellsRef = useRef<Set<string>>(new Set());
 
-  const isMultiplayer = mode === 'coop' || mode === 'race';
   const mistakeCellSet = useMemo(() => new Set(mistakeCells), [mistakeCells]);
+  const puzzleContentKey = useMemo(() => puzzle.map((r) => r.join(',')).join(';'), [puzzle]);
+  const effectivePuzzleKey = puzzleKeyProp || puzzleContentKey;
+  const totalMultiplayerHints = multiplayerMatchHintsLeft + accountHintCredits;
 
-  // Reset per-puzzle state when a new puzzle loads
+  // Reset per-puzzle state ONLY when a brand-new puzzle loads (never on WebSocket room:state updates for the same puzzle)
   useEffect(() => {
     setUndoStack([]);
     setSelectedCell(null);
     setSelectedNumber(null);
     setBoardCellHighlight(false);
+    setCreditNotice(null);
+    if (isMultiplayer) {
+      setFastPencil(Boolean(fastPencilUnlocked));
+    }
     const initialScored = new Set<string>();
     if (solution) {
       for (let r = 0; r < 9; r++) {
@@ -128,7 +150,24 @@ export function SudokuBoard({
     }
     scoredCellsRef.current = initialScored;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [puzzle]);
+  }, [effectivePuzzleKey]);
+
+  const prevFastUnlockedRef = useRef(Boolean(fastPencilUnlocked));
+  useEffect(() => {
+    if (!isMultiplayer) return;
+    if (fastPencilUnlocked && !prevFastUnlockedRef.current) {
+      setFastPencil(true);
+      setCreditNotice(null);
+      playToggleSound(true);
+    }
+    prevFastUnlockedRef.current = Boolean(fastPencilUnlocked);
+  }, [isMultiplayer, fastPencilUnlocked]);
+
+  useEffect(() => {
+    if (!creditNotice) return;
+    const t = window.setTimeout(() => setCreditNotice(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [creditNotice]);
 
   // Auto-computed candidates when Fast Pencil is ON
   const autoCandidates = useMemo(() => {
@@ -396,8 +435,51 @@ export function SudokuBoard({
     applyDigitToCell(r, c, 0, false);
   }, [selectedCell, isPaused, readOnly, puzzle, applyDigitToCell]);
 
+  const handleFastPencilToggle = useCallback(() => {
+    if (isPaused || readOnly) return;
+    if (!isMultiplayer) {
+      setFastPencil((v) => {
+        const next = !v;
+        playToggleSound(next);
+        return next;
+      });
+      return;
+    }
+
+    if (fastPencilUnlocked) {
+      setFastPencil((v) => {
+        const next = !v;
+        playToggleSound(next);
+        return next;
+      });
+      return;
+    }
+
+    if (accountPencilCredits > 0) {
+      setCreditNotice(null);
+      onMultiplayerUnlockFastPencil?.();
+    } else {
+      playButtonClickSound();
+      setCreditNotice('No Pencil credits remaining. Complete a Co-op or Match game to earn Pencil credits!');
+    }
+  }, [isPaused, readOnly, isMultiplayer, fastPencilUnlocked, accountPencilCredits, onMultiplayerUnlockFastPencil]);
+
   const handleHint = useCallback(() => {
-    if (isPaused || readOnly || isMultiplayer || !onLocalStateChange || !solution) return;
+    if (isPaused || readOnly) return;
+
+    if (isMultiplayer) {
+      if (totalMultiplayerHints <= 0) {
+        playButtonClickSound();
+        setCreditNotice('All 3 hints used! Complete a Co-op or Match game to earn more Hint credits.');
+        return;
+      }
+      setCreditNotice(null);
+      playCorrectSound();
+      onMultiplayerHint?.(selectedCell?.[0], selectedCell?.[1]);
+      return;
+    }
+
+    if (!onLocalStateChange || !solution) return;
 
     let target: [number, number] | null = null;
     if (selectedCell) {
@@ -460,6 +542,8 @@ export function SudokuBoard({
     isPaused,
     readOnly,
     isMultiplayer,
+    totalMultiplayerHints,
+    onMultiplayerHint,
     onLocalStateChange,
     selectedCell,
     puzzle,
@@ -510,7 +594,7 @@ export function SudokuBoard({
         return;
       }
       if (e.key.toLowerCase() === 'f') {
-        setFastPencil((v) => !v);
+        handleFastPencilToggle();
         return;
       }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
@@ -531,7 +615,7 @@ export function SudokuBoard({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isPaused, readOnly, selectedCell, puzzle, applyDigitToCell, handleUndo, onTogglePause, isMultiplayer]);
+  }, [isPaused, readOnly, selectedCell, puzzle, applyDigitToCell, handleUndo, handleFastPencilToggle, onTogglePause, isMultiplayer]);
 
   const canEraseSelected = Boolean(
     selectedCell &&
@@ -763,7 +847,7 @@ export function SudokuBoard({
         <div className="lg:col-span-5 w-full max-w-[520px] mx-auto lg:max-w-none space-y-4">
           {/* Action Tools */}
           <div className="p-3.5 sm:p-4 rounded-2xl bg-[#FCF8F2] dark:bg-[#29201B] border border-[#E8D5BC] dark:border-[#3D3028] shadow-sm space-y-3">
-            <div className={`grid gap-2 ${isMultiplayer ? 'grid-cols-3' : 'grid-cols-5'}`}>
+            <div className={`grid gap-2 ${isMultiplayer ? 'grid-cols-4' : 'grid-cols-5'}`}>
               {!isMultiplayer && (
                 <button
                   type="button"
@@ -807,23 +891,24 @@ export function SudokuBoard({
               {/* Signature Blue Lightning Fast Pencil Button */}
               <button
                 type="button"
-                onClick={() => {
-                  const next = !fastPencil;
-                  setFastPencil(next);
-                  playToggleSound(next);
-                }}
+                onClick={handleFastPencilToggle}
+                disabled={isPaused || readOnly}
                 aria-pressed={fastPencil}
-                className={`min-h-[54px] flex flex-col items-center justify-center gap-1 rounded-xl transition-all cursor-pointer touch-manipulation select-none ${
+                className={`min-h-[54px] flex flex-col items-center justify-center gap-1 rounded-xl transition-all cursor-pointer touch-manipulation select-none disabled:opacity-40 ${
                   fastPencil
                     ? 'bg-blue-600 text-white shadow-md shadow-blue-600/25 ring-2 ring-blue-400/50'
+                    : isMultiplayer && !fastPencilUnlocked && accountPencilCredits <= 0
+                    ? 'bg-blue-50/60 dark:bg-blue-950/25 text-blue-700/60 dark:text-blue-300/60 border border-blue-200/60 dark:border-blue-800/40'
                     : 'bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800/60'
                 }`}
               >
                 <Zap className={`w-4 h-4 ${fastPencil ? 'fill-white' : 'fill-blue-600/20'}`} />
-                <span className="text-[11px] font-semibold whitespace-nowrap">Fast</span>
+                <span className="text-[11px] font-semibold whitespace-nowrap">
+                  {isMultiplayer && !fastPencilUnlocked ? `Fast (${accountPencilCredits})` : 'Fast'}
+                </span>
               </button>
 
-              {!isMultiplayer && (
+              {!isMultiplayer ? (
                 <button
                   type="button"
                   onClick={handleHint}
@@ -833,8 +918,39 @@ export function SudokuBoard({
                   <Lightbulb className="w-4 h-4 text-[#B98B68]" />
                   <span className="text-[11px] font-semibold">Hint ({hintsUsed})</span>
                 </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleHint}
+                  disabled={isPaused || readOnly || totalMultiplayerHints <= 0}
+                  data-mp-hint-btn="true"
+                  className="min-h-[54px] flex flex-col items-center justify-center gap-1 rounded-xl bg-[#F7F0E5] dark:bg-[#352A23] hover:bg-[#E8D5BC] dark:hover:bg-[#46382E] text-[#49382D] dark:text-[#F5EBDD] disabled:opacity-40 transition-colors cursor-pointer touch-manipulation select-none"
+                >
+                  <Lightbulb className="w-4 h-4 text-[#B98B68]" />
+                  <span className="text-[11px] font-semibold whitespace-nowrap">
+                    Hint ({totalMultiplayerHints})
+                  </span>
+                </button>
               )}
             </div>
+
+            {isMultiplayer && (
+              <div className="flex items-center justify-between gap-2 px-1 text-[11px] text-[#76533D] dark:text-[#D2C2B0] font-mono-tabular">
+                <span>
+                  Hints left: <strong className="text-[#49382D] dark:text-[#F5EBDD]">{totalMultiplayerHints}</strong>
+                  {accountHintCredits > 0 ? ` (${multiplayerMatchHintsLeft} match + ${accountHintCredits} saved)` : ` (${multiplayerMatchHintsLeft}/3)`}
+                </span>
+                <span>
+                  Pencil credits: <strong className="text-[#49382D] dark:text-[#F5EBDD]">{accountPencilCredits}</strong>
+                </span>
+              </div>
+            )}
+
+            {creditNotice && (
+              <div className="px-3 py-2 rounded-xl bg-[#E8D5BC]/70 dark:bg-[#352A23] border border-[#B98B68]/40 text-xs text-[#49382D] dark:text-[#F5EBDD]">
+                {creditNotice}
+              </div>
+            )}
 
             {fastPencil && (
               <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-50 dark:bg-blue-950/45 border border-blue-200 dark:border-blue-800/60 text-xs text-blue-800 dark:text-blue-200">

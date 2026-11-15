@@ -70,6 +70,8 @@ db.exec(`
     best_time_medium INTEGER,
     best_time_hard INTEGER,
     best_time_expert INTEGER,
+    hint_credits INTEGER NOT NULL DEFAULT 0,
+    pencil_credits INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -155,7 +157,26 @@ db.exec(`
     unlocked_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (user_id, achievement_id)
   );
+
+  CREATE TABLE IF NOT EXISTS match_reward_claims (
+    match_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL,
+    hint_credits_earned INTEGER NOT NULL DEFAULT 0,
+    pencil_credits_earned INTEGER NOT NULL DEFAULT 0,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (match_id, user_id)
+  );
 `);
+
+// Safe migrations for existing databases
+const userTableCols = (db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>).map((c) => c.name);
+if (!userTableCols.includes('hint_credits')) {
+  db.exec('ALTER TABLE users ADD COLUMN hint_credits INTEGER NOT NULL DEFAULT 0');
+}
+if (!userTableCols.includes('pencil_credits')) {
+  db.exec('ALTER TABLE users ADD COLUMN pencil_credits INTEGER NOT NULL DEFAULT 0');
+}
 
 // Security & Crypto Helpers
 function hashPassword(password: string): string {
@@ -244,6 +265,8 @@ interface DbUserRow {
   best_time_medium: number | null;
   best_time_hard: number | null;
   best_time_expert: number | null;
+  hint_credits: number;
+  pencil_credits: number;
   created_at: string;
 }
 
@@ -272,6 +295,8 @@ function mapUserRowToProfile(row: DbUserRow): UserProfile {
     bestTimeMedium: row.best_time_medium,
     bestTimeHard: row.best_time_hard,
     bestTimeExpert: row.best_time_expert,
+    hintCredits: row.hint_credits ?? 0,
+    pencilCredits: row.pencil_credits ?? 0,
     createdAt: row.created_at,
   };
 }
@@ -1235,6 +1260,18 @@ app.get('/api/leaderboards', requireAuth, (req: AuthedRequest, res: Response) =>
 });
 
 // --- REAL-TIME MULTIPLAYER ENGINE (WebSocket) ---
+interface ServerParticipantMatchState {
+  hintsRemaining: number;
+  hintsUsed: number;
+  fastPencilUnlocked: boolean;
+  matchReward: {
+    matchId: string;
+    hintCredits: number;
+    pencilCredits: number;
+    xpEarned: number;
+  } | null;
+}
+
 interface ServerRoomParticipant {
   userId: number;
   username: string;
@@ -1246,6 +1283,15 @@ interface ServerRoomParticipant {
   raceNotes: number[][][];
   raceMistakes: number;
   raceScore: number;
+  hintsRemaining: number;
+  hintsUsed: number;
+  fastPencilUnlocked: boolean;
+  matchReward: {
+    matchId: string;
+    hintCredits: number;
+    pencilCredits: number;
+    xpEarned: number;
+  } | null;
   finishedAt: number | null;
   rematchReady: boolean;
 }
@@ -1256,6 +1302,8 @@ interface ServerRoom {
   mode: 'coop' | 'race';
   difficulty: Difficulty;
   status: 'waiting' | 'playing' | 'finished';
+  matchId: string;
+  rewardsGranted: boolean;
   hostId: number;
   puzzle: number[][];
   solution: number[][];
@@ -1269,8 +1317,11 @@ interface ServerRoom {
   winnerId: number | null;
   winnerUsername: string | null;
   participants: Map<number, ServerRoomParticipant>;
+  participantStates: Map<number, ServerParticipantMatchState>;
   chat: RoomChatMessage[];
 }
+
+const MATCH_STARTING_HINTS = 3;
 
 const rooms = new Map<string, ServerRoom>();
 const userActiveRoom = new Map<number, string>();
@@ -1294,8 +1345,109 @@ function generateRoomCode(): string {
   return rooms.has(code) ? generateRoomCode() : code;
 }
 
+function grantMultiplayerMatchRewards(params: {
+  matchId: string;
+  userId: number;
+  mode: 'coop' | 'race';
+  difficulty: Difficulty;
+  won: boolean;
+}): { hintCredits: number; pencilCredits: number } {
+  const isHardOrExpert = params.difficulty === 'hard' || params.difficulty === 'expert';
+  let hintCredits = 1;
+  let pencilCredits = 2;
+
+  if (params.mode === 'coop') {
+    hintCredits = isHardOrExpert ? 2 : 1;
+    pencilCredits = isHardOrExpert ? 3 : 2;
+  } else {
+    if (params.won) {
+      hintCredits = 2;
+      pencilCredits = isHardOrExpert ? 3 : 2;
+    } else {
+      hintCredits = 1;
+      pencilCredits = 1;
+    }
+  }
+
+  const grantTx = db.transaction(() => {
+    const claimRes = db
+      .prepare(
+        `INSERT OR IGNORE INTO match_reward_claims (match_id, user_id, mode, hint_credits_earned, pencil_credits_earned)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(params.matchId, params.userId, params.mode, hintCredits, pencilCredits);
+
+    if (claimRes.changes > 0) {
+      db.prepare(
+        'UPDATE users SET hint_credits = hint_credits + ?, pencil_credits = pencil_credits + ? WHERE id = ?'
+      ).run(hintCredits, pencilCredits, params.userId);
+      return true;
+    }
+    return false;
+  });
+
+  const grantedNow = grantTx();
+  if (!grantedNow) {
+    const existing = db
+      .prepare(
+        'SELECT hint_credits_earned as hintCredits, pencil_credits_earned as pencilCredits FROM match_reward_claims WHERE match_id = ? AND user_id = ?'
+      )
+      .get(params.matchId, params.userId) as { hintCredits: number; pencilCredits: number } | undefined;
+    return existing || { hintCredits: 0, pencilCredits: 0 };
+  }
+
+  return { hintCredits, pencilCredits };
+}
+
+function finishMultiplayerRoom(room: ServerRoom, winnerUserId: number, winnerLabel: string) {
+  if (room.status === 'finished' || room.rewardsGranted) return;
+  room.status = 'finished';
+  room.rewardsGranted = true;
+  room.finishedAt = Date.now();
+  room.winnerId = winnerUserId;
+  room.winnerUsername = winnerLabel;
+
+  const durationSeconds = Math.max(1, Math.round((room.finishedAt - (room.startedAt || room.finishedAt)) / 1000));
+
+  for (const p of room.participants.values()) {
+    const won = room.mode === 'coop' ? true : p.userId === winnerUserId;
+    const creditReward = grantMultiplayerMatchRewards({
+      matchId: room.matchId,
+      userId: p.userId,
+      mode: room.mode,
+      difficulty: room.difficulty,
+      won,
+    });
+    const statsReward = awardStatsAndAchievements({
+      userId: p.userId,
+      mode: room.mode,
+      difficulty: room.difficulty,
+      durationSeconds,
+      mistakes: room.mode === 'coop' ? room.coopMistakes : p.raceMistakes,
+      hintsUsed: p.hintsUsed,
+      score: room.mode === 'coop' ? room.coopScore : p.raceScore,
+      won,
+    });
+
+    p.matchReward = {
+      matchId: room.matchId,
+      hintCredits: creditReward.hintCredits,
+      pencilCredits: creditReward.pencilCredits,
+      xpEarned: statsReward.xpEarned,
+    };
+    const savedState = room.participantStates.get(p.userId);
+    if (savedState) {
+      savedState.matchReward = p.matchReward;
+    }
+  }
+}
+
 function buildRoomViewForUser(room: ServerRoom, userId: number): MultiplayerRoomView {
   const me = room.participants.get(userId);
+  const accountCredits = db
+    .prepare('SELECT hint_credits, pencil_credits FROM users WHERE id = ?')
+    .get(userId) as { hint_credits: number; pencil_credits: number } | undefined;
+
   const participants: RoomParticipant[] = Array.from(room.participants.values()).map((p) => {
     const boardToMeasure = room.mode === 'coop' ? room.coopBoard : p.raceBoard;
     const stats = getProgressStats(room.puzzle, boardToMeasure, room.solution);
@@ -1352,6 +1504,13 @@ function buildRoomViewForUser(room: ServerRoom, userId: number): MultiplayerRoom
     finishedAt: room.finishedAt,
     winnerId: room.winnerId,
     winnerUsername: room.winnerUsername,
+    matchId: room.matchId,
+    myHintsRemaining: me ? me.hintsRemaining : MATCH_STARTING_HINTS,
+    myHintsUsed: me ? me.hintsUsed : 0,
+    myFastPencilUnlocked: me ? me.fastPencilUnlocked : false,
+    myAccountHintCredits: accountCredits?.hint_credits ?? 0,
+    myAccountPencilCredits: accountCredits?.pencil_credits ?? 0,
+    myMatchReward: me ? me.matchReward : null,
     participants,
     chat: room.chat.slice(-50),
   };
@@ -1489,12 +1648,15 @@ async function startServer() {
 
             const { puzzle, solution } = generateSudoku(difficulty);
             const code = generateRoomCode();
+            const matchId = crypto.randomUUID();
             const room: ServerRoom = {
               code,
               name: roomName,
               mode,
               difficulty,
               status: 'waiting',
+              matchId,
+              rewardsGranted: false,
               hostId: userId,
               puzzle,
               solution,
@@ -1508,6 +1670,7 @@ async function startServer() {
               winnerId: null,
               winnerUsername: null,
               participants: new Map(),
+              participantStates: new Map(),
               chat: [
                 {
                   id: crypto.randomUUID(),
@@ -1521,6 +1684,13 @@ async function startServer() {
               ],
             };
 
+            const hostState: ServerParticipantMatchState = {
+              hintsRemaining: MATCH_STARTING_HINTS,
+              hintsUsed: 0,
+              fastPencilUnlocked: false,
+              matchReward: null,
+            };
+            room.participantStates.set(userId, hostState);
             room.participants.set(userId, {
               userId,
               username: latestUser.username,
@@ -1532,6 +1702,10 @@ async function startServer() {
               raceNotes: createEmptyNotes(),
               raceMistakes: 0,
               raceScore: 0,
+              hintsRemaining: hostState.hintsRemaining,
+              hintsUsed: hostState.hintsUsed,
+              fastPencilUnlocked: hostState.fastPencilUnlocked,
+              matchReward: hostState.matchReward,
               finishedAt: null,
               rematchReady: false,
             });
@@ -1565,6 +1739,16 @@ async function startServer() {
 
             let participant = room.participants.get(userId);
             if (!participant) {
+              let savedState = room.participantStates.get(userId);
+              if (!savedState) {
+                savedState = {
+                  hintsRemaining: MATCH_STARTING_HINTS,
+                  hintsUsed: 0,
+                  fastPencilUnlocked: false,
+                  matchReward: null,
+                };
+                room.participantStates.set(userId, savedState);
+              }
               participant = {
                 userId,
                 username: latestUser.username,
@@ -1576,6 +1760,10 @@ async function startServer() {
                 raceNotes: createEmptyNotes(),
                 raceMistakes: 0,
                 raceScore: 0,
+                hintsRemaining: savedState.hintsRemaining,
+                hintsUsed: savedState.hintsUsed,
+                fastPencilUnlocked: savedState.fastPencilUnlocked,
+                matchReward: savedState.matchReward,
                 finishedAt: null,
                 rematchReady: false,
               };
@@ -1722,23 +1910,7 @@ async function startServer() {
 
                 // Check co-op completion
                 if (isBoardSolved(room.coopBoard, room.solution)) {
-                  room.status = 'finished';
-                  room.finishedAt = Date.now();
-                  room.winnerId = userId;
-                  room.winnerUsername = 'Team';
-                  const durationSeconds = Math.max(1, Math.round((room.finishedAt - (room.startedAt || room.finishedAt)) / 1000));
-                  for (const p of room.participants.values()) {
-                    awardStatsAndAchievements({
-                      userId: p.userId,
-                      mode: 'coop',
-                      difficulty: room.difficulty,
-                      durationSeconds,
-                      mistakes: room.coopMistakes,
-                      hintsUsed: 0,
-                      score: room.coopScore,
-                      won: true,
-                    });
-                  }
+                  finishMultiplayerRoom(room, userId, 'Team');
                 }
               }
               broadcastRoomState(room);
@@ -1779,27 +1951,150 @@ async function startServer() {
 
                 if (isBoardSolved(participant.raceBoard, room.solution)) {
                   participant.finishedAt = Date.now();
-                  room.status = 'finished';
-                  room.finishedAt = Date.now();
-                  room.winnerId = userId;
-                  room.winnerUsername = participant.username;
-                  const durationSeconds = Math.max(1, Math.round((room.finishedAt - (room.startedAt || room.finishedAt)) / 1000));
-                  for (const p of room.participants.values()) {
-                    awardStatsAndAchievements({
-                      userId: p.userId,
-                      mode: 'race',
-                      difficulty: room.difficulty,
-                      durationSeconds,
-                      mistakes: p.raceMistakes,
-                      hintsUsed: 0,
-                      score: p.raceScore,
-                      won: p.userId === userId,
-                    });
-                  }
+                  finishMultiplayerRoom(room, userId, participant.username);
                 }
               }
               broadcastRoomState(room);
             }
+            break;
+          }
+
+          case 'room:hint': {
+            const code = userActiveRoom.get(userId);
+            if (!code) break;
+            const room = rooms.get(code);
+            if (!room || room.status !== 'playing') break;
+
+            const participant = room.participants.get(userId);
+            if (!participant) break;
+
+            const targetBoard = room.mode === 'coop' ? room.coopBoard : participant.raceBoard;
+            const targetNotes = room.mode === 'coop' ? room.coopNotes : participant.raceNotes;
+
+            let target: [number, number] | null = null;
+            const reqRow = Number(msg.row);
+            const reqCol = Number(msg.col);
+            if (
+              Number.isInteger(reqRow) &&
+              Number.isInteger(reqCol) &&
+              reqRow >= 0 &&
+              reqRow < 9 &&
+              reqCol >= 0 &&
+              reqCol < 9 &&
+              room.puzzle[reqRow][reqCol] === 0 &&
+              targetBoard[reqRow][reqCol] !== room.solution[reqRow][reqCol]
+            ) {
+              target = [reqRow, reqCol];
+            }
+
+            if (!target) {
+              for (let r = 0; r < 9; r++) {
+                for (let c = 0; c < 9; c++) {
+                  if (room.puzzle[r][c] === 0 && targetBoard[r][c] !== room.solution[r][c]) {
+                    target = [r, c];
+                    break;
+                  }
+                }
+                if (target) break;
+              }
+            }
+            if (!target) break;
+
+            if (participant.hintsRemaining > 0) {
+              participant.hintsRemaining -= 1;
+            } else {
+              const deductRes = db
+                .prepare('UPDATE users SET hint_credits = hint_credits - 1 WHERE id = ? AND hint_credits > 0')
+                .run(userId);
+              if (deductRes.changes === 0) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'error',
+                    message: 'No hints remaining! Complete a game to earn more hint credits.',
+                  })
+                );
+                break;
+              }
+            }
+
+            participant.hintsUsed += 1;
+            const savedState = room.participantStates.get(userId);
+            if (savedState) {
+              savedState.hintsRemaining = participant.hintsRemaining;
+              savedState.hintsUsed = participant.hintsUsed;
+            }
+
+            const [tr, tc] = target;
+            const answer = room.solution[tr][tc];
+            targetBoard[tr][tc] = answer;
+            targetNotes[tr][tc] = [];
+
+            for (let i = 0; i < 9; i++) {
+              targetNotes[tr][i] = targetNotes[tr][i].filter((n) => n !== answer);
+              targetNotes[i][tc] = targetNotes[i][tc].filter((n) => n !== answer);
+            }
+            const br = Math.floor(tr / 3) * 3;
+            const bc = Math.floor(tc / 3) * 3;
+            for (let r = br; r < br + 3; r++) {
+              for (let c = bc; c < bc + 3; c++) {
+                targetNotes[r][c] = targetNotes[r][c].filter((n) => n !== answer);
+              }
+            }
+
+            if (room.mode === 'coop') {
+              room.coopActors[`${tr}-${tc}`] = {
+                userId,
+                username: latestUser.username,
+                avatarId: latestUser.avatar_id,
+                value: answer,
+                updatedAt: Date.now(),
+              };
+              room.coopScore = Math.max(0, room.coopScore - 25);
+              if (isBoardSolved(room.coopBoard, room.solution)) {
+                finishMultiplayerRoom(room, userId, 'Team');
+              }
+            } else {
+              participant.raceScore = Math.max(0, participant.raceScore - 25);
+              if (isBoardSolved(participant.raceBoard, room.solution)) {
+                participant.finishedAt = Date.now();
+                finishMultiplayerRoom(room, userId, participant.username);
+              }
+            }
+
+            broadcastRoomState(room);
+            break;
+          }
+
+          case 'room:use-pencil-credit': {
+            const code = userActiveRoom.get(userId);
+            if (!code) break;
+            const room = rooms.get(code);
+            if (!room || room.status !== 'playing') break;
+
+            const participant = room.participants.get(userId);
+            if (!participant) break;
+
+            if (!participant.fastPencilUnlocked) {
+              const deductRes = db
+                .prepare('UPDATE users SET pencil_credits = pencil_credits - 1 WHERE id = ? AND pencil_credits > 0')
+                .run(userId);
+              if (deductRes.changes === 0) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'error',
+                    message: 'No Pencil credits remaining! Complete a game to earn more Pencil credits.',
+                  })
+                );
+                break;
+              }
+              participant.fastPencilUnlocked = true;
+              const savedState = room.participantStates.get(userId);
+              if (savedState) {
+                savedState.fastPencilUnlocked = true;
+              }
+            }
+
+            broadcastRoomState(room);
             break;
           }
 
@@ -1834,6 +2129,8 @@ async function startServer() {
             const allReady = Array.from(room.participants.values()).every((p) => !p.isConnected || p.rematchReady);
             if (allReady) {
               const { puzzle, solution } = generateSudoku(room.difficulty);
+              room.matchId = crypto.randomUUID();
+              room.rewardsGranted = false;
               room.puzzle = puzzle;
               room.solution = solution;
               room.coopBoard = cloneBoard(puzzle);
@@ -1846,13 +2143,24 @@ async function startServer() {
               room.finishedAt = null;
               room.winnerId = null;
               room.winnerUsername = null;
+              room.participantStates.clear();
               for (const p of room.participants.values()) {
                 p.raceBoard = cloneBoard(puzzle);
                 p.raceNotes = createEmptyNotes();
                 p.raceMistakes = 0;
                 p.raceScore = 0;
+                p.hintsRemaining = MATCH_STARTING_HINTS;
+                p.hintsUsed = 0;
+                p.fastPencilUnlocked = false;
+                p.matchReward = null;
                 p.finishedAt = null;
                 p.rematchReady = false;
+                room.participantStates.set(p.userId, {
+                  hintsRemaining: MATCH_STARTING_HINTS,
+                  hintsUsed: 0,
+                  fastPencilUnlocked: false,
+                  matchReward: null,
+                });
               }
               room.chat.push({
                 id: crypto.randomUUID(),

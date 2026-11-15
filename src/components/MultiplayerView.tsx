@@ -5,7 +5,9 @@ import {
   Copy,
   Crown,
   DoorOpen,
+  Lightbulb,
   MessageCircle,
+  Pencil,
   Play,
   RefreshCw,
   Send,
@@ -324,13 +326,24 @@ export function MultiplayerView() {
                   }
                   elapsedSeconds={liveSeconds}
                   mistakes={activeMistakes}
-                  hintsUsed={0}
+                  hintsUsed={activeRoom.myHintsUsed}
                   score={activeScore}
                   fastPencilDefault={user?.fastPencilDefault}
                   readOnly={activeRoom.status === 'finished' || introPlaying}
                   coopActors={activeRoom.coopActors}
+                  puzzleKey={`${activeRoom.code}-${activeRoom.matchId}`}
+                  multiplayerMatchHintsLeft={activeRoom.myHintsRemaining}
+                  accountHintCredits={activeRoom.myAccountHintCredits}
+                  accountPencilCredits={activeRoom.myAccountPencilCredits}
+                  fastPencilUnlocked={activeRoom.myFastPencilUnlocked}
                   onMultiplayerMove={(row, col, value, isPencil) => {
                     sendWs({ type: 'room:move', row, col, value, isPencil });
+                  }}
+                  onMultiplayerHint={(row, col) => {
+                    sendWs({ type: 'room:hint', row, col });
+                  }}
+                  onMultiplayerUnlockFastPencil={() => {
+                    sendWs({ type: 'room:use-pencil-credit' });
                   }}
                 />
               )
@@ -354,6 +367,40 @@ export function MultiplayerView() {
                 <p className="text-xs text-[#49382D]/85 dark:text-[#D2C2B0] font-mono-tabular">
                   Match time: {formatDuration(liveSeconds)}
                 </p>
+
+                {activeRoom.myMatchReward && (
+                  <div
+                    data-match-rewards="true"
+                    className="p-3 rounded-2xl bg-[#FCF8F2]/85 dark:bg-[#29201B]/90 border border-[#B98B68]/35 space-y-2"
+                  >
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-display font-bold text-[#49382D] dark:text-[#F5EBDD]">
+                        Rewards Earned
+                      </span>
+                      <span className="font-mono-tabular font-bold text-[#76533D] dark:text-[#C99A75]">
+                        +{activeRoom.myMatchReward.xpEarned} XP
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div className="p-2 rounded-xl bg-[#F7F0E5] dark:bg-[#352A23] flex items-center gap-2">
+                        <Lightbulb className="w-3.5 h-3.5 text-[#B98B68] shrink-0" />
+                        <span className="font-mono-tabular font-semibold text-[#49382D] dark:text-[#F5EBDD]">
+                          +{activeRoom.myMatchReward.hintCredits} Hint{activeRoom.myMatchReward.hintCredits === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-xl bg-[#F7F0E5] dark:bg-[#352A23] flex items-center gap-2">
+                        <Pencil className="w-3.5 h-3.5 text-[#76533D] dark:text-[#C99A75] shrink-0" />
+                        <span className="font-mono-tabular font-semibold text-[#49382D] dark:text-[#F5EBDD]">
+                          +{activeRoom.myMatchReward.pencilCredits} Pencil{activeRoom.myMatchReward.pencilCredits === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-[#76533D] dark:text-[#D2C2B0] font-mono-tabular">
+                      Saved balance: {activeRoom.myAccountHintCredits} Hint · {activeRoom.myAccountPencilCredits} Pencil credits
+                    </p>
+                  </div>
+                )}
+
                 <button
                   type="button"
                   onClick={() => sendWs({ type: 'room:rematch' })}

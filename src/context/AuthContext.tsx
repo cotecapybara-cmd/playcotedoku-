@@ -106,6 +106,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const msg = JSON.parse(event.data);
         if (msg.type === 'room:state') {
           setActiveRoom(msg.room);
+          if (
+            msg.room &&
+            typeof msg.room.myAccountHintCredits === 'number' &&
+            typeof msg.room.myAccountPencilCredits === 'number'
+          ) {
+            setUser((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    hintCredits: msg.room.myAccountHintCredits,
+                    pencilCredits: msg.room.myAccountPencilCredits,
+                  }
+                : prev
+            );
+          }
         } else if (msg.type === 'room:left') {
           setActiveRoom(null);
         } else if (msg.type === 'room:list') {

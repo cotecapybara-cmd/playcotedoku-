@@ -49,6 +49,8 @@ export interface UserProfile {
   bestTimeMedium: number | null;
   bestTimeHard: number | null;
   bestTimeExpert: number | null;
+  hintCredits: number;
+  pencilCredits: number;
   createdAt: string;
 }
 
@@ -183,6 +185,18 @@ export interface MultiplayerRoomView {
   finishedAt: number | null;
   winnerId: number | null;
   winnerUsername: string | null;
+  matchId: string;
+  myHintsRemaining: number;
+  myHintsUsed: number;
+  myFastPencilUnlocked: boolean;
+  myAccountHintCredits: number;
+  myAccountPencilCredits: number;
+  myMatchReward?: {
+    matchId: string;
+    hintCredits: number;
+    pencilCredits: number;
+    xpEarned: number;
+  } | null;
   participants: RoomParticipant[];
   chat: RoomChatMessage[];
 }
